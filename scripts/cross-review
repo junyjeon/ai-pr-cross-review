@@ -1,0 +1,92 @@
+#!/bin/bash
+# cross-review: Codex(high recall) + Claude(high precision) 교차 PR 리뷰
+# Usage: cross-review [base-branch]
+
+set -euo pipefail
+
+BASE=${1:-main}
+DIFF=$(git diff "$BASE")
+
+if [ -z "$DIFF" ]; then
+  echo "No changes against $BASE"
+  exit 0
+fi
+
+DIFF_LINES=$(echo "$DIFF" | wc -l)
+CHANGED_FILES=$(git diff --name-only "$BASE")
+FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l)
+
+# 브랜치 이름에서 타입 추출 (feat/xxx, fix/xxx 등)
+BRANCH=$(git branch --show-current)
+TYPE=$(echo "$BRANCH" | grep -oP '^(feat|fix|refactor|perf|chore)' || echo "general")
+
+case $TYPE in
+  feat)     FOCUS="error handling, edge cases, missing validation, feature completeness" ;;
+  fix)      FOCUS="is the bug actually fixed, regressions, new side effects" ;;
+  refactor) FOCUS="behavior must be unchanged, flag semantic differences" ;;
+  perf)     FOCUS="is the optimization real, correctness issues" ;;
+  *)        FOCUS="bugs, security, error handling, performance" ;;
+esac
+
+echo "Diff: $DIFF_LINES lines across $FILE_COUNT files against $BASE"
+echo "Branch: $BRANCH (type: $TYPE)"
+echo "Focus: $FOCUS"
+echo ""
+
+# ── Step 1: Codex review (high recall) ────────────
+echo "Step 1: Codex review (high recall)..."
+
+GPT_RESULT=$(codex review --base "$BASE" "Find ALL potential issues. Focus: $FOCUS.
+Also check for: security vulnerabilities, race conditions, error handling gaps, performance problems.
+For each issue: file, line (approximate), severity (critical/high/medium/low), title, description, suggestion.
+Do NOT flag style/formatting issues. Prioritize completeness over precision.")
+
+echo "$GPT_RESULT" > /tmp/cross-review-gpt.txt
+ISSUE_COUNT=$(echo "$GPT_RESULT" | grep -ciE '(critical|high|medium|low)' || echo "0")
+echo "  Codex found ~$ISSUE_COUNT potential issues"
+echo ""
+
+# 이슈 없으면 종료
+if [ "$ISSUE_COUNT" -eq 0 ]; then
+  echo "No issues found."
+  exit 0
+fi
+
+# ── Step 2: Claude validation (high precision) ────
+echo "Step 2: Claude validation (high precision)..."
+
+CLAUDE_RESULT=$(claude -p "You are a precision-focused code review validator.
+Below are issues flagged by another AI reviewer, followed by the actual diff.
+
+## Issues Found by First Reviewer
+$GPT_RESULT
+
+## Diff
+$DIFF
+
+Validate each issue:
+- verdict: confirmed / likely / uncertain / false_positive
+- reasoning: why you made this judgment
+
+Rules:
+- Only confirm issues you are 100% certain about.
+- If you spot additional critical issues the first reviewer missed, add them.
+- Be conservative. False positives waste developer time.
+
+Format each issue clearly with the verdict.")
+
+echo "$CLAUDE_RESULT" > /tmp/cross-review-claude.txt
+echo "  Claude validation complete"
+echo ""
+
+# ── Output ────────────────────────────────────────
+echo "========================================"
+echo "Cross-Review Results"
+echo "========================================"
+echo ""
+echo "$CLAUDE_RESULT"
+echo ""
+echo "----------------------------------------"
+echo "Full logs:"
+echo "  GPT:    /tmp/cross-review-gpt.txt"
+echo "  Claude: /tmp/cross-review-claude.txt"

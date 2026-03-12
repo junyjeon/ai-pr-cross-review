@@ -1,0 +1,45 @@
+name: AI Cross-Review (Codex + Claude CLI)
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    name: Cross-Review (CLI)
+    runs-on: self-hosted
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Get PR diff
+        run: |
+          git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr_diff.txt
+          DIFF_LINES=$(wc -l < /tmp/pr_diff.txt)
+          echo "Diff: $DIFF_LINES lines"
+
+      - name: Save PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printenv PR_BODY > /tmp/pr_body.txt
+
+      - name: Run cross-review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          REPO: ${{ github.repository }}
+        run: node .github/scripts/ai-review.mjs
