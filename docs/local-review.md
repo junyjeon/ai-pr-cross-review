@@ -17,7 +17,9 @@ API 키가 필요 없다. 각 CLI가 구독 인증을 처리한다.
 
 ```bash
 # Step 1: Codex — 광범위 스캔
-codex review --base main "Find ALL bugs and issues. Be thorough." > /tmp/gpt-review.txt
+# codex review는 출력을 stderr로 보낸다. 2>&1로 캡처한다.
+# --base와 프롬프트를 함께 쓸 수 없다. Codex가 자체 판단으로 리뷰한다.
+codex review --base main 2>&1 | tee /tmp/gpt-review.txt
 
 # Step 2: Claude — 정밀 검증
 claude -p "Validate these findings. Only confirm real issues.

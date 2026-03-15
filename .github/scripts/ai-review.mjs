@@ -26,28 +26,37 @@ const CONFIG = {
 };
 
 // ─── CLI Helpers ─────────────────────────────────────────
-function runCodexReview(baseBranch, prTitle, focus) {
-  const prompt = `Find ALL potential issues in this PR.
-Focus: ${focus}
-PR title: ${prTitle}
-
-For each issue provide: file, line (approximate), severity (critical/high/medium/low), title, description, suggestion.
-Do NOT flag style/formatting issues. Prioritize completeness over precision.`;
-
+function runCodexReview(baseBranch) {
+  // codex review --base는 프롬프트와 함께 쓸 수 없다. 단독 사용.
+  // codex는 모든 출력을 stderr로 보내므로 2>&1로 캡처한다.
   try {
-    const result = execSync(
-      `codex review --base "${baseBranch}" ${JSON.stringify(prompt)}`,
+    const raw = execSync(
+      `codex review --base "${baseBranch}" 2>&1`,
       {
         encoding: "utf-8",
         timeout: CONFIG.cli_timeout_ms,
         maxBuffer: 10 * 1024 * 1024,
-        stdio: ["pipe", "pipe", "pipe"],
+        shell: true,
       }
     );
-    return result.trim();
+    // 마지막 "codex" 행 이후가 실제 리뷰 결과
+    const lines = raw.split("\n");
+    let lastCodexIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() === "codex") {
+        lastCodexIdx = i;
+        break;
+      }
+    }
+    const review = lastCodexIdx >= 0
+      ? lines.slice(lastCodexIdx + 1).join("\n").trim()
+      : raw.trim();
+    return review;
   } catch (err) {
     if (err.killed) throw new Error("Codex review timed out");
-    throw new Error(`Codex review failed: ${err.stderr || err.message}`);
+    // execSync throws on non-zero exit — stderr is in err.stderr or err.stdout (due to 2>&1)
+    const output = err.stdout || err.stderr || err.message;
+    throw new Error(`Codex review failed: ${output}`);
   }
 }
 
@@ -146,7 +155,7 @@ async function runReview() {
 
   // 이슈 없으면 종료
   const issueCount =
-    (codexResult.match(/critical|high|medium|low/gi) || []).length;
+    (codexResult.match(/critical|high|medium|low|\[P\d\]/gi) || []).length;
   if (issueCount === 0) {
     console.log("  No issues found!");
     await postComment(

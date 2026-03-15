@@ -36,13 +36,17 @@ echo ""
 # ── Step 1: Codex review (high recall) ────────────
 echo "Step 1: Codex review (high recall)..."
 
-GPT_RESULT=$(codex review --base "$BASE" "Find ALL potential issues. Focus: $FOCUS.
-Also check for: security vulnerabilities, race conditions, error handling gaps, performance problems.
-For each issue: file, line (approximate), severity (critical/high/medium/low), title, description, suggestion.
-Do NOT flag style/formatting issues. Prioritize completeness over precision.")
+# codex review는 모든 출력을 stderr로 보낸다. 2>&1로 캡처한다.
+# codex review --base는 프롬프트와 함께 쓸 수 없다. 단독 사용.
+CODEX_RAW=$(codex review --base "$BASE" 2>&1 || true)
+
+# 마지막 "codex\n" 이후가 실제 리뷰 결과다.
+# awk: 마지막 "codex" 행 이후 텍스트 추출
+GPT_RESULT=$(echo "$CODEX_RAW" | awk '/^codex$/{found=NR; buf=""} found && NR>found{buf=buf"\n"$0} END{print buf}' | sed '/^$/d')
 
 echo "$GPT_RESULT" > /tmp/cross-review-gpt.txt
-ISSUE_COUNT=$(echo "$GPT_RESULT" | grep -ciE '(critical|high|medium|low)' || echo "0")
+ISSUE_COUNT=$(echo "$GPT_RESULT" | grep -ciE '(critical|high|medium|low|\[P[0-9]\])' || true)
+ISSUE_COUNT=${ISSUE_COUNT:-0}
 echo "  Codex found ~$ISSUE_COUNT potential issues"
 echo ""
 
