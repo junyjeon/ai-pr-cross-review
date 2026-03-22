@@ -9,7 +9,7 @@
  * Step 3: 결과를 PR 코멘트로 게시
  */
 
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 import { readFileSync, existsSync } from "fs";
 
 // ─── Config ──────────────────────────────────────────────
@@ -28,44 +28,49 @@ const CONFIG = {
 // ─── CLI Helpers ─────────────────────────────────────────
 function runCodexReview(baseBranch) {
   // codex review --base는 프롬프트와 함께 쓸 수 없다. 단독 사용.
-  // codex는 모든 출력을 stderr로 보내므로 2>&1로 캡처한다.
-  try {
-    const raw = execSync(
-      `codex review --base "${baseBranch}" 2>&1`,
-      {
-        encoding: "utf-8",
-        timeout: CONFIG.cli_timeout_ms,
-        maxBuffer: 10 * 1024 * 1024,
-        shell: true,
-      }
-    );
-    // 마지막 "codex" 행 이후가 실제 리뷰 결과
-    const lines = raw.split("\n");
-    let lastCodexIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].trim() === "codex") {
-        lastCodexIdx = i;
-        break;
-      }
-    }
-    const review = lastCodexIdx >= 0
-      ? lines.slice(lastCodexIdx + 1).join("\n").trim()
-      : raw.trim();
-    return review;
-  } catch (err) {
-    if (err.killed) throw new Error("Codex review timed out");
-    // execSync throws on non-zero exit — stderr is in err.stderr or err.stdout (due to 2>&1)
-    const output = err.stdout || err.stderr || err.message;
-    throw new Error(`Codex review failed: ${output}`);
+  // codex는 모든 출력을 stderr로 보낸다.
+  // spawnSync로 쉘을 거치지 않아 injection을 방지하고, stderr에 직접 접근한다.
+  const result = spawnSync("codex", ["review", "--base", baseBranch], {
+    encoding: "utf-8",
+    timeout: CONFIG.cli_timeout_ms,
+    maxBuffer: 10 * 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") throw new Error("Codex review timed out");
+    throw new Error(`Codex review failed: ${result.error.message}`);
   }
+
+  if (result.status !== 0) {
+    throw new Error(`Codex review failed (exit ${result.status}): ${result.stderr}`);
+  }
+
+  // stderr에서 마지막 "codex" 행 이후가 실제 리뷰 결과
+  const raw = result.stderr || "";
+  const lines = raw.split("\n");
+  let lastCodexIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() === "codex") {
+      lastCodexIdx = i;
+      break;
+    }
+  }
+  const review = lastCodexIdx >= 0
+    ? lines.slice(lastCodexIdx + 1).join("\n").trim()
+    : raw.trim();
+  return review;
 }
 
-function runClaudeValidation(codexResult, diff, prTitle, prBody) {
+function runClaudeValidation(codexResult, diff, prTitle, prBody, focus) {
   let prompt = `You are a precision-focused code review validator.
 Below are issues flagged by another AI reviewer, followed by the actual diff.
 
 ## PR Title
 ${prTitle}
+
+## Review Focus
+${focus}
 `;
 
   if (prBody) {
@@ -90,18 +95,22 @@ Rules:
 
 Format each issue clearly with the verdict.`;
 
-  try {
-    const result = execSync(`claude -p ${JSON.stringify(prompt)}`, {
-      encoding: "utf-8",
-      timeout: CONFIG.cli_timeout_ms,
-      maxBuffer: 10 * 1024 * 1024,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    return result.trim();
-  } catch (err) {
-    if (err.killed) throw new Error("Claude validation timed out");
-    throw new Error(`Claude validation failed: ${err.stderr || err.message}`);
+  // spawnSync + stdin으로 프롬프트 전달. 쉘을 거치지 않아 injection 방지.
+  const result = spawnSync("claude", ["-p"], {
+    input: prompt,
+    encoding: "utf-8",
+    timeout: CONFIG.cli_timeout_ms,
+    maxBuffer: 10 * 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") throw new Error("Claude validation timed out");
+    throw new Error(`Claude validation failed: ${result.error.message}`);
   }
+  if (result.status !== 0) {
+    throw new Error(`Claude validation failed (exit ${result.status}): ${result.stderr}`);
+  }
+  return result.stdout.trim();
 }
 
 // ─── Main Review Flow ────────────────────────────────────
@@ -142,7 +151,7 @@ async function runReview() {
   console.log("Step 1: Codex review (high recall)...");
   let codexResult;
   try {
-    codexResult = runCodexReview(baseBranch, prTitle, focus);
+    codexResult = runCodexReview(baseBranch);
     console.log("  Codex review complete");
   } catch (err) {
     console.error(`  Codex review failed: ${err.message}`);
@@ -153,24 +162,25 @@ async function runReview() {
     return;
   }
 
-  // 이슈 없으면 종료
-  const issueCount =
-    (codexResult.match(/critical|high|medium|low|\[P\d\]/gi) || []).length;
-  if (issueCount === 0) {
-    console.log("  No issues found!");
+  // Codex 출력이 비어있으면 종료. 비어있지 않으면 Claude로 전달한다.
+  // severity 키워드 카운트는 참고용 — 유무 판단에 쓰지 않는다.
+  if (!codexResult.trim()) {
+    console.log("  Codex returned empty result — no issues found.");
     await postComment(
       "## AI Cross-Review\n\nNo issues found.\n\n" +
         "<sub>Codex (recall) + Claude (precision)</sub>"
     );
     return;
   }
+  const issueCount =
+    (codexResult.match(/critical|high|medium|low|\[P\d\]/gi) || []).length;
   console.log(`  ~${issueCount} potential issues found\n`);
 
   // ── Step 2: Claude validation ──────────────────────
   console.log("Step 2: Claude validation (high precision)...");
   let claudeResult;
   try {
-    claudeResult = runClaudeValidation(codexResult, diff, prTitle, prBody);
+    claudeResult = runClaudeValidation(codexResult, diff, prTitle, prBody, focus);
     console.log("  Claude validation complete\n");
   } catch (err) {
     console.error(`  Claude validation failed: ${err.message}`);
@@ -226,8 +236,8 @@ async function postComment(body) {
         }
       );
     }
-  } catch {
-    // 정리 실패는 무시
+  } catch (cleanupErr) {
+    console.warn("Failed to clean up previous bot comment:", cleanupErr.message);
   }
 
   // 새 코멘트 게시

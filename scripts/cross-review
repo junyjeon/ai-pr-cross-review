@@ -38,29 +38,47 @@ echo "Step 1: Codex review (high recall)..."
 
 # codex review는 모든 출력을 stderr로 보낸다. 2>&1로 캡처한다.
 # codex review --base는 프롬프트와 함께 쓸 수 없다. 단독 사용.
-CODEX_RAW=$(codex review --base "$BASE" 2>&1 || true)
+CODEX_EXIT=0
+CODEX_RAW=$(codex review --base "$BASE" 2>&1) || CODEX_EXIT=$?
 
-# 마지막 "codex\n" 이후가 실제 리뷰 결과다.
-# awk: 마지막 "codex" 행 이후 텍스트 추출
-GPT_RESULT=$(echo "$CODEX_RAW" | awk '/^codex$/{found=NR; buf=""} found && NR>found{buf=buf"\n"$0} END{print buf}' | sed '/^$/d')
+if [ "$CODEX_EXIT" -ne 0 ]; then
+  echo "  Codex review failed (exit $CODEX_EXIT):"
+  echo "$CODEX_RAW" | tail -5
+  exit 1
+fi
 
-echo "$GPT_RESULT" > /tmp/cross-review-gpt.txt
+# 마지막 "codex" 행 이후가 실제 리뷰 결과다.
+# sentinel이 없으면 전체 출력을 사용한다 (fallback).
+if echo "$CODEX_RAW" | grep -q '^codex$'; then
+  GPT_RESULT=$(echo "$CODEX_RAW" | awk '/^codex$/{found=NR; buf=""} found && NR>found{buf=buf"\n"$0} END{print buf}' | sed '/^$/d')
+else
+  GPT_RESULT=$(echo "$CODEX_RAW" | sed '/^$/d')
+fi
+
+GPT_FILE=$(mktemp /tmp/cross-review-gpt.XXXXXX)
+CLAUDE_FILE=$(mktemp /tmp/cross-review-claude.XXXXXX)
+echo "$GPT_RESULT" > "$GPT_FILE"
+
+# Codex 출력이 비어있으면 종료. 비어있지 않으면 Claude로 전달한다.
+if [ -z "$GPT_RESULT" ]; then
+  echo "  Codex returned empty result — no issues found."
+  exit 0
+fi
+
 ISSUE_COUNT=$(echo "$GPT_RESULT" | grep -ciE '(critical|high|medium|low|\[P[0-9]\])' || true)
 ISSUE_COUNT=${ISSUE_COUNT:-0}
 echo "  Codex found ~$ISSUE_COUNT potential issues"
 echo ""
 
-# 이슈 없으면 종료
-if [ "$ISSUE_COUNT" -eq 0 ]; then
-  echo "No issues found."
-  exit 0
-fi
-
 # ── Step 2: Claude validation (high precision) ────
 echo "Step 2: Claude validation (high precision)..."
 
-CLAUDE_RESULT=$(claude -p "You are a precision-focused code review validator.
+# stdin으로 프롬프트 전달. 쉘 메타문자가 있는 diff/결과도 안전하다.
+CLAUDE_PROMPT="You are a precision-focused code review validator.
 Below are issues flagged by another AI reviewer, followed by the actual diff.
+
+## Review Focus
+$FOCUS
 
 ## Issues Found by First Reviewer
 $GPT_RESULT
@@ -77,9 +95,11 @@ Rules:
 - If you spot additional critical issues the first reviewer missed, add them.
 - Be conservative. False positives waste developer time.
 
-Format each issue clearly with the verdict.")
+Format each issue clearly with the verdict."
 
-echo "$CLAUDE_RESULT" > /tmp/cross-review-claude.txt
+CLAUDE_RESULT=$(echo "$CLAUDE_PROMPT" | claude -p)
+
+echo "$CLAUDE_RESULT" > "$CLAUDE_FILE"
 echo "  Claude validation complete"
 echo ""
 
@@ -92,5 +112,5 @@ echo "$CLAUDE_RESULT"
 echo ""
 echo "----------------------------------------"
 echo "Full logs:"
-echo "  GPT:    /tmp/cross-review-gpt.txt"
-echo "  Claude: /tmp/cross-review-claude.txt"
+echo "  GPT:    $GPT_FILE"
+echo "  Claude: $CLAUDE_FILE"
