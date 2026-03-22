@@ -1,3 +1,9 @@
+/**
+ * WARNING: 이 파일은 AI 리뷰어 테스트용 의도적 취약 코드다.
+ * SQL injection, XSS, path traversal, hardcoded secret 등
+ * 보안 취약점이 의도적으로 포함되어 있다.
+ * 절대 프로덕션에 배포하지 말 것.
+ */
 import express from "express";
 
 const router = express.Router();
